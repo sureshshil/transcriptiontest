@@ -7,23 +7,19 @@
 - **ADLS Gen2 Storage**: `fparecordingadls` (`IsHnsEnabled: True`)
   - Container / Filesystem: `fpa-recording`
   - PCM Directory: `fpa-recording/pcm/`
-  - WAV Directory: `fpa-recording/wav/`
+  - WAV Directory: `fpa-recording/wav/` (`speech_10min_spoken.wav` — 10-min spoken English, `25.23 MB`, 75 phrases)
 
-## 2. Implemented Workflow
-1. **Audio Synthesis & PCM Creation**:
-   - Synthesized natural English speech audio matching exactly **2 minutes (120 seconds)**.
-   - Saved 16-bit 22.05 kHz mono linear PCM (`5,292,000` bytes).
-2. **ADLS Gen2 Upload**:
-   - Uploaded raw PCM file to ADLS Gen2: `fpa-recording/pcm/recording_2min.pcm`.
-3. **PCM to WAV Conversion**:
-   - Downloaded PCM stream and dynamically prepended RIFF/WAVE header (44-byte standard PCM format).
-   - Saved converted audio to ADLS Gen2: `fpa-recording/wav/recording_2min.wav` (`5,292,044` bytes).
-4. **SAS Token URL Generation**:
-   - Generated a secure Shared Access Signature (SAS) token for the WAV blob.
-5. **Azure Fast Transcription SDK Execution**:
-   - Used `azure-ai-transcription` SDK with `transcribe_from_url(audio_url=wav_sas_url, options=options)`.
+---
 
-## 3. Benchmark Results
-- **Audio Duration**: 120.00 seconds (2.0 minutes)
-- **Fast Transcription SDK Latency**: **1.66 seconds**
-- **Transcription Status**: Succeeded with phrase breakdown and offset timestamps.
+## 2. Consolidated Master Benchmark Comparison (All 8 Options)
+
+| # | Method & Script | Blob Fetch Method | Speech API Call Method | Works w/ Strict Storage Firewall? | Returns SDK `TranscriptionResult`? | Needs SDK Patch? | Latency (10-min Audio) | Peak RAM (25.2 MB Audio) | Peak RAM (320 MB 2-Hr Audio) |
+| :-: | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | **SAS URL (Server-to-Server)**<br>[`test_10min_spoken_real.py`](../test_10min_spoken_real.py) | None *(Speech fetches SAS URL directly)* | `speech_client.transcribe_from_url()` | Only if Trusted Azure Services enabled | Yes | No | **`3.44 s`** | **`0.22 MB`** | **`0.22 MB`** |
+| **2** | **Default SDK (`64 MB` chunks)**<br>[`test_10min_spoken_real.py`](../test_10min_spoken_real.py) | `BlobClient` *(Default 64 MB)* | `speech_client.transcribe()` | Yes (Pod MI) | Yes | No | `5.04 s` | `236.12 MB` | `> 1,200 MB` *(OOM)* |
+| **3** | **Tuned SDK (`4 MB` chunks)**<br>[`test_true_zero_buffer_stream.py`](../test_true_zero_buffer_stream.py) | `BlobClient` *(4 MB chunks)* | `speech_client.transcribe()` | Yes (Pod MI) | Yes | No | `4.54 s` | `56.21 MB` | `~645 MB` *(2x file)* |
+| **4** | **`BlobMultipartBody` + `send_request` (Unpatched)**<br>[`test_sdk_send_request_streaming.py`](../test_sdk_send_request_streaming.py) | `BlobClient` *(4 MB chunks + MI)* | `speech_client.send_request()` | Yes (Pod MI) | Yes | No | `5.15 s` | **`40.48 MB`** | **`40.48 MB`** *(Constant)* |
+| **5** | **`BlobMultipartBody` + `send_request` (Patched)**<br>[`test_sdk_send_request_streaming.py`](../test_sdk_send_request_streaming.py) | `BlobClient` *(4 MB chunks + MI)* | `speech_client.send_request()` | Yes (Pod MI) | Yes | Yes (`del __len__`) | **`4.71 s`** | **`12.47 MB`** | **`12.47 MB`** *(Constant)* |
+| **6** | **HTTP Blob + SDK `send_request` (Recommended)**<br>[`test_http_blob_plus_sdk_send_request.py`](../test_http_blob_plus_sdk_send_request.py) | **`requests.get(stream=True)` + MI Token** | **`speech_client.send_request()`** | **Yes (Pod MI)** | **Yes** | **No** | **`~4.70 s`** | **`10.27 MB`** | **`10.27 MB`** *(Constant)* |
+| **7** | **Pure HTTP Stream (No SDK)**<br>[`test_pure_stream_low_ram.py`](../test_pure_stream_low_ram.py) / [`run_clean_comparison.py`](../run_clean_comparison.py) | `requests.get(stream=True)` + MI Token | `requests.post(data=gen)` | Yes (Pod MI) | No *(Raw dict)* | No | **`4.65 s`** | **`4.06 – 4.77 MB`** | **`4.06 – 4.77 MB`** *(Constant)* |
+| **8** | **Pod `/tmp` Temp File**<br>[`test_pod_temp_file.py`](../test_pod_temp_file.py) | `BlobClient.download_to_stream(file)` | `requests.post(data=gen)` | Yes (Pod MI) | No *(Raw dict)* | No | `6.14 s` *(Slower)* | `4.68 MB` *(+ Disk)* | `4.68 MB` *(+ 320 MB Disk)* |

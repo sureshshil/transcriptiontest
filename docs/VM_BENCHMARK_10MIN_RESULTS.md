@@ -1,33 +1,20 @@
 # Azure Fast Transcription: 10-Minute Audio Benchmark on Azure VM
 
-- **Environment**: Azure VM `vm-b1ls` (`20.89.145.69`) in `japaneast`
-- **Audio File**: 10 Minutes (600 seconds), 16kHz Mono 16-bit PCM WAV (`19,200,044` bytes / `18.31 MB`)
-- **Storage**: ADLS Gen2 `fparecordingadls` (`fpa-recording/wav/audio_10min.wav`)
+- **Environment**: Azure VM `vm-b1ls` (`Standard_B1ls`, `0.5 GB RAM`) in `japaneast`
+- **Storage**: ADLS Gen2 `fparecordingadls` (`fpa-recording/wav/speech_10min_spoken.wav`, `25.23 MB`, 75 phrases)
 - **Speech Service**: `speech-poc-jp.cognitiveservices.azure.com` (`japaneast`)
 
 ---
 
-## Benchmark Results
+## Consolidated Master Benchmark Comparison (All 8 Options)
 
-| Method | Peak Audio RAM | Blob Download Time | Transcribe / Execution Time | Total Latency |
-| :--- | :--- | :--- | :--- | :--- |
-| **1. Single Shot (Full Memory)** | **18.31 MB** | 0.31 s | 3.00 s | **3.31 s** |
-| **2. Chunked Streaming (4MB max)** | **4.00 MB** | *Pipelined concurrently* | 0.91 s | **0.91 s** |
-| **3. SAS URL (Direct Storage-to-Speech)** | **0.00 MB** | *0.00 s (Direct)* | 2.85 s | **2.85 s** |
-
----
-
-## Key Observations
-
-1. **Why Streaming (Method 2) is the fastest (`0.91 s`)**:
-   - Azure Speech Fast Transcription endpoint supports streaming multipart data using chunked transfer.
-   - The VM pulls a 4MB chunk from ADLS and streams it into the HTTP socket simultaneously.
-   - Speech Service begins processing frames as chunks arrive, overlapping transfer and transcription.
-
-2. **Why Single Shot (Method 1) took `3.31 s`**:
-   - The entire 19.2 MB is buffered in RAM first before opening the HTTP upload connection.
-   - Inside the same Azure region, downloading 18 MB took only **0.31 seconds** (vs ~3.4s when testing locally).
-
-3. **Why SAS URL (Method 3) took `2.85 s`**:
-   - Zero VM memory or bandwidth used.
-   - Speech Service downloads directly from ADLS Storage over the internal backbone and executes transcription.
+| # | Method & Script | Blob Fetch Method | Speech API Call Method | Works w/ Strict Storage Firewall? | Returns SDK `TranscriptionResult`? | Needs SDK Patch? | Latency (10-min Audio) | Peak RAM (25.2 MB Audio) | Peak RAM (320 MB 2-Hr Audio) |
+| :-: | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | **SAS URL (Server-to-Server)**<br>[`test_10min_spoken_real.py`](../test_10min_spoken_real.py) | None *(Speech fetches SAS URL directly)* | `speech_client.transcribe_from_url()` | Only if Trusted Azure Services enabled | Yes | No | **`3.44 s`** | **`0.22 MB`** | **`0.22 MB`** |
+| **2** | **Default SDK (`64 MB` chunks)**<br>[`test_10min_spoken_real.py`](../test_10min_spoken_real.py) | `BlobClient` *(Default 64 MB)* | `speech_client.transcribe()` | Yes (Pod MI) | Yes | No | `5.04 s` | `236.12 MB` | `> 1,200 MB` *(OOM)* |
+| **3** | **Tuned SDK (`4 MB` chunks)**<br>[`test_true_zero_buffer_stream.py`](../test_true_zero_buffer_stream.py) | `BlobClient` *(4 MB chunks)* | `speech_client.transcribe()` | Yes (Pod MI) | Yes | No | `4.54 s` | `56.21 MB` | `~645 MB` *(2x file)* |
+| **4** | **`BlobMultipartBody` + `send_request` (Unpatched)**<br>[`test_sdk_send_request_streaming.py`](../test_sdk_send_request_streaming.py) | `BlobClient` *(4 MB chunks + MI)* | `speech_client.send_request()` | Yes (Pod MI) | Yes | No | `5.15 s` | **`40.48 MB`** | **`40.48 MB`** *(Constant)* |
+| **5** | **`BlobMultipartBody` + `send_request` (Patched)**<br>[`test_sdk_send_request_streaming.py`](../test_sdk_send_request_streaming.py) | `BlobClient` *(4 MB chunks + MI)* | `speech_client.send_request()` | Yes (Pod MI) | Yes | Yes (`del __len__`) | **`4.71 s`** | **`12.47 MB`** | **`12.47 MB`** *(Constant)* |
+| **6** | **HTTP Blob + SDK `send_request` (Recommended)**<br>[`test_http_blob_plus_sdk_send_request.py`](../test_http_blob_plus_sdk_send_request.py) | **`requests.get(stream=True)` + MI Token** | **`speech_client.send_request()`** | **Yes (Pod MI)** | **Yes** | **No** | **`~4.70 s`** | **`10.27 MB`** | **`10.27 MB`** *(Constant)* |
+| **7** | **Pure HTTP Stream (No SDK)**<br>[`test_pure_stream_low_ram.py`](../test_pure_stream_low_ram.py) / [`run_clean_comparison.py`](../run_clean_comparison.py) | `requests.get(stream=True)` + MI Token | `requests.post(data=gen)` | Yes (Pod MI) | No *(Raw dict)* | No | **`4.65 s`** | **`4.06 – 4.77 MB`** | **`4.06 – 4.77 MB`** *(Constant)* |
+| **8** | **Pod `/tmp` Temp File**<br>[`test_pod_temp_file.py`](../test_pod_temp_file.py) | `BlobClient.download_to_stream(file)` | `requests.post(data=gen)` | Yes (Pod MI) | No *(Raw dict)* | No | `6.14 s` *(Slower)* | `4.68 MB` *(+ Disk)* | `4.68 MB` *(+ 320 MB Disk)* |
