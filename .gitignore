@@ -1,0 +1,15 @@
+# Secrets and environment variables
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Audio test artifacts
+*.wav
+*.pcm
+*.ogg
+*.opus
