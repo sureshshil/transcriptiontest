@@ -1,0 +1,83 @@
+<policies>
+    <inbound>
+        <base />
+        <!-- Separate counter from the AI operation's "backend-counter" -->
+        <cache-lookup-value key="speech-backend-counter" variable-name="speech-backend-counter" default-value="0" />
+        <!-- Cooldown state per backend: cached "cool until" time (UTC ticks). Missing or expired = healthy -->
+        <cache-lookup-value key="speech-cd-0" variable-name="speech-cd-0" default-value="0" />
+        <cache-lookup-value key="speech-cd-1" variable-name="speech-cd-1" default-value="0" />
+        <set-variable name="speech-ok-0" value='@{ long t; long.TryParse(context.Variables["speech-cd-0"].ToString(), out t); return DateTime.UtcNow.Ticks >= t; }' />
+        <set-variable name="speech-ok-1" value='@{ long t; long.TryParse(context.Variables["speech-cd-1"].ToString(), out t); return DateTime.UtcNow.Ticks >= t; }' />
+        <!-- Round robin picks the first choice; skip it if cooling down; "none" if both are -->
+        <set-variable name="speech-target" value='@{
+            string first = (string)context.Variables["speech-backend-counter"] == "0" ? "0" : "1";
+            string second = first == "0" ? "1" : "0";
+            if ((bool)context.Variables["speech-ok-" + first]) { return first; }
+            if ((bool)context.Variables["speech-ok-" + second]) { return second; }
+            return "none";
+        }' />
+        <choose>
+            <when condition='@((string)context.Variables["speech-target"] == "0")'>
+                <set-backend-service base-url="{{n-jpn-de-jcus-speech-fpa-base-url}}" />
+            </when>
+            <when condition='@((string)context.Variables["speech-target"] == "1")'>
+                <set-backend-service base-url="{{n-jpn-de-jcus-speech-fpa-base-url-1}}" />
+            </when>
+            <otherwise>
+                <!-- Both cooling down: tell the worker exactly how long to wait -->
+                <return-response>
+                    <set-status code="503" reason="Both Speech backends cooling down" />
+                    <set-header name="Retry-After" exists-action="override">
+                        <value>@{
+                            long a, b;
+                            long.TryParse(context.Variables["speech-cd-0"].ToString(), out a);
+                            long.TryParse(context.Variables["speech-cd-1"].ToString(), out b);
+                            double secs = (Math.Min(a, b) - DateTime.UtcNow.Ticks) / (double)TimeSpan.TicksPerSecond;
+                            return Math.Max(1, (int)Math.Ceiling(secs)).ToString();
+                        }</value>
+                    </set-header>
+                </return-response>
+            </otherwise>
+        </choose>
+        <!-- Same Speech path in both regions; api-version is copied over -->
+        <rewrite-uri template="/speechtotext/transcriptions:transcribe" copy-unmatched-params="true" />
+        <set-variable name="speech-next-counter" value='@(((int.Parse((string)context.Variables["speech-backend-counter"]) + 1) % 2).ToString())' />
+        <cache-store-value key="speech-backend-counter" value='@((string)context.Variables["speech-next-counter"])' duration="100" />
+    </inbound>
+    <backend>
+        <forward-request timeout="900" />
+    </backend>
+    <outbound>
+        <base />
+        <choose>
+            <when condition='@(context.Response.StatusCode == 429 || context.Response.StatusCode >= 500)'>
+                <!-- Cool this backend down for its Retry-After (clamped 5-300s, default 30s) -->
+                <set-variable name="speech-cd-secs" value='@{
+                    int s;
+                    if (!int.TryParse(context.Response.Headers.GetValueOrDefault("Retry-After", ""), out s)) { s = 30; }
+                    return Math.Min(Math.Max(s, 5), 300);
+                }' />
+                <cache-store-value key='@("speech-cd-" + (string)context.Variables["speech-target"])'
+                    value='@(DateTime.UtcNow.AddSeconds((int)context.Variables["speech-cd-secs"]).Ticks.ToString())'
+                    duration='@((int)context.Variables["speech-cd-secs"])' />
+                <!-- Retry-After for the worker: 0 if the other backend is free, else until one recovers -->
+                <set-header name="Retry-After" exists-action="override">
+                    <value>@{
+                        string other = (string)context.Variables["speech-target"] == "0" ? "1" : "0";
+                        if ((bool)context.Variables["speech-ok-" + other]) { return "0"; }
+                        long until;
+                        long.TryParse(context.Variables["speech-cd-" + other].ToString(), out until);
+                        int otherSecs = (int)Math.Ceiling((until - DateTime.UtcNow.Ticks) / (double)TimeSpan.TicksPerSecond);
+                        return Math.Max(1, Math.Min((int)context.Variables["speech-cd-secs"], otherSecs)).ToString();
+                    }</value>
+                </set-header>
+                <!-- Worker's parser prefers these over Retry-After, so drop them -->
+                <set-header name="retry-after-ms" exists-action="delete" />
+                <set-header name="x-ms-retry-after-ms" exists-action="delete" />
+            </when>
+        </choose>
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
