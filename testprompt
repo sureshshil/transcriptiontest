@@ -1,0 +1,41 @@
+Goal: a real burst test of our APIM endpoints for Speech fast transcription and
+Azure OpenAI chat completions (non-production). Put it in tests/apim_burst/.
+Do not modify existing production code or config.
+
+Inputs from env vars only: APIM base URL, APIM subscription key, Speech
+api-version, path to a short test audio file (5-10 s WAV), AI deployment path.
+Never hardcode secrets.
+
+Script (Python, asyncio + httpx, no pytest). Configure httpx limits so 100
+requests really run concurrently (max_connections >= 100). Two modes:
+
+Mode A - raw burst, no retries:
+- Fire N requests at the same instant (asyncio.gather), N from a CLI arg,
+  default 100.
+- For each request record: index, start time, end time, latency, status code,
+  x-backend header, Retry-After, retry-after-ms (should be absent).
+- Run for Speech and for AI separately (AI: tiny prompt, max_tokens=5).
+
+Mode B - burst through our real worker retry logic:
+- Fire N requests concurrently using our existing async retry function / client
+  (the one with retry_total=0 / max_retries=0 that honours Retry-After).
+- For each request record: final status, attempts, backend of each attempt
+  (from x-backend), each wait used, total time.
+
+Output:
+- One CSV per run in tests/apim_burst/results/ with a timestamp in the name.
+- A printed summary per run:
+  - count by status code (200 / 429 / 503 / other)
+  - count by backend (0 / 1)
+  - latency p50 / p95 / max
+  - Mode B: success rate, attempts distribution, how many retries switched
+    backend, total wall-clock time
+  - Retry-After values seen on 429 vs 503
+- Flag as FAIL: any 429 whose Retry-After is not 1 while the other backend kept
+  returning 200; any response containing retry-after-ms; Mode B success rate
+  below 100%.
+
+CLI: --target speech|ai --mode A|B --n 100 --waves 1 --wave-gap 30
+(waves > 1 sends another burst after the gap, to watch cooldowns expire).
+
+Show me the files before running anything.
