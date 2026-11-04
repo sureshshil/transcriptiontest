@@ -1,0 +1,120 @@
+<policies>
+    <inbound>
+        <base />
+        <!-- One cache record holds both cooldown deadlines: "<until0>|<until1>" (UTC ticks). One lookup per section. -->
+        <cache-lookup-value key="ai-cd" variable-name="ai-cd" default-value="0|0" />
+        <set-variable name="ai-cd-0" value='@{
+            string s = (string)context.Variables["ai-cd"];
+            int i = s.IndexOf("|");
+            long t = 0;
+            if (i > 0) { long.TryParse(s.Substring(0, i), out t); }
+            return t;
+        }' />
+        <set-variable name="ai-cd-1" value='@{
+            string s = (string)context.Variables["ai-cd"];
+            int i = s.IndexOf("|");
+            long t = 0;
+            if (i >= 0) { long.TryParse(s.Substring(i + 1), out t); }
+            return t;
+        }' />
+        <set-variable name="ai-ok-0" value='@(DateTime.UtcNow.Ticks >= (long)context.Variables["ai-cd-0"])' />
+        <set-variable name="ai-ok-1" value='@(DateTime.UtcNow.Ticks >= (long)context.Variables["ai-cd-1"])' />
+        <!-- Both healthy: random 50/50. One cooling: the other. Both cooling: "none" -->
+        <set-variable name="ai-target" value='@{
+            bool ok0 = (bool)context.Variables["ai-ok-0"];
+            bool ok1 = (bool)context.Variables["ai-ok-1"];
+            if (ok0 == ok1) { return ok0 ? (new Random().Next(2) == 0 ? "0" : "1") : "none"; }
+            return ok0 ? "0" : "1";
+        }' />
+        <choose>
+            <when condition='@((string)context.Variables["ai-target"] == "0")'>
+                <set-backend-service base-url="{{n-jpn-de-jcus-ai-fpa-base-url}}" />
+                <rewrite-uri template="/{{n-jpn-de-jcus-ai-fpa-deployment}}/chat/completions" />
+            </when>
+            <when condition='@((string)context.Variables["ai-target"] == "1")'>
+                <set-backend-service base-url="{{n-jpn-de-jcus-ai-fpa-base-url-1}}" />
+                <rewrite-uri template="/{{n-jpn-de-jcus-ai-fpa-deployment-1}}/chat/completions" />
+            </when>
+            <otherwise>
+                <!-- Both cooling down: tell the worker exactly how long to wait -->
+                <return-response>
+                    <set-status code="503" reason="Both AI backends cooling down" />
+                    <set-header name="Retry-After" exists-action="override">
+                        <value>@{
+                            long soonest = Math.Min((long)context.Variables["ai-cd-0"], (long)context.Variables["ai-cd-1"]);
+                            double secs = (soonest - DateTime.UtcNow.Ticks) / (double)TimeSpan.TicksPerSecond;
+                            return Math.Max(1, (int)Math.Ceiling(secs)).ToString();
+                        }</value>
+                    </set-header>
+                </return-response>
+            </otherwise>
+        </choose>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+        <choose>
+            <when condition='@(context.Response.StatusCode == 429 || context.Response.StatusCode >= 500)'>
+                <!-- Cooldown from backend hint: retry-after-ms first, then Retry-After seconds, else 30s. Clamped 5-300s. -->
+                <set-variable name="ai-cd-secs" value='@{
+                    double s = 30;
+                    double v;
+                    string ms = context.Response.Headers.GetValueOrDefault("retry-after-ms", context.Response.Headers.GetValueOrDefault("x-ms-retry-after-ms", ""));
+                    string sec = context.Response.Headers.GetValueOrDefault("Retry-After", "");
+                    if (double.TryParse(ms, out v)) { s = v / 1000; }
+                    else if (double.TryParse(sec, out v)) { s = v; }
+                    return (int)Math.Ceiling(Math.Min(Math.Max(s, 5), 300));
+                }' />
+                <!-- Re-read the latest record (state may have changed during a long request) -->
+                <cache-lookup-value key="ai-cd" variable-name="ai-cd-latest" default-value="0|0" />
+                <set-variable name="ai-latest-0" value='@{
+                    string s = (string)context.Variables["ai-cd-latest"];
+                    int i = s.IndexOf("|");
+                    long t = 0;
+                    if (i > 0) { long.TryParse(s.Substring(0, i), out t); }
+                    return t;
+                }' />
+                <set-variable name="ai-latest-1" value='@{
+                    string s = (string)context.Variables["ai-cd-latest"];
+                    int i = s.IndexOf("|");
+                    long t = 0;
+                    if (i >= 0) { long.TryParse(s.Substring(i + 1), out t); }
+                    return t;
+                }' />
+                <!-- Never shorten an existing cooldown: keep the later deadline -->
+                <set-variable name="ai-new-until" value='@{
+                    long proposed = DateTime.UtcNow.AddSeconds((int)context.Variables["ai-cd-secs"]).Ticks;
+                    long existing = (string)context.Variables["ai-target"] == "0" ? (long)context.Variables["ai-latest-0"] : (long)context.Variables["ai-latest-1"];
+                    return Math.Max(proposed, existing);
+                }' />
+                <cache-store-value key="ai-cd" duration="300" value='@{
+                    bool isZero = (string)context.Variables["ai-target"] == "0";
+                    long u = (long)context.Variables["ai-new-until"];
+                    long c0 = isZero ? u : (long)context.Variables["ai-latest-0"];
+                    long c1 = isZero ? (long)context.Variables["ai-latest-1"] : u;
+                    return c0.ToString() + "|" + c1.ToString();
+                }' />
+                <!-- Retry-After for the worker, from the latest state: 1s if the other backend is free, else until one recovers -->
+                <set-header name="Retry-After" exists-action="override">
+                    <value>@{
+                        bool isZero = (string)context.Variables["ai-target"] == "0";
+                        long now = DateTime.UtcNow.Ticks;
+                        long otherUntil = isZero ? (long)context.Variables["ai-latest-1"] : (long)context.Variables["ai-latest-0"];
+                        if (now >= otherUntil) { return "1"; }
+                        long soonest = Math.Min(otherUntil, (long)context.Variables["ai-new-until"]);
+                        int secs = (int)Math.Ceiling((soonest - now) / (double)TimeSpan.TicksPerSecond);
+                        return Math.Max(1, secs).ToString();
+                    }</value>
+                </set-header>
+                <!-- Worker's parser prefers these over Retry-After, so drop them -->
+                <set-header name="retry-after-ms" exists-action="delete" />
+                <set-header name="x-ms-retry-after-ms" exists-action="delete" />
+            </when>
+        </choose>
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
