@@ -1,0 +1,26 @@
+#codebase Review how the Retry-After value is used in this repo.
+
+Context: an APIM gateway in front of our Speech and Azure OpenAI backends now
+returns "Retry-After: 0" when one backend is throttled but the other is free.
+A value of 0 means "retry immediately". A positive value means "both backends
+are cooling down, wait this many seconds". APIM also removes retry-after-ms and
+x-ms-retry-after-ms on these responses.
+
+Tasks:
+1. Find every place that calls retry_after_from_headers() or parse_retry_after(),
+   or otherwise uses their return value (including the RetryTelemetry class and
+   any retry loops).
+2. For each place, check whether a return value of 0.0 is handled as
+   "retry immediately". Flag any of these bugs:
+   - truthiness checks on the value (if delay:, if not delay:, delay or default)
+   - a minimum delay / floor / clamp applied even when the value is 0
+   - 0 being replaced by a default backoff or jitter
+   - the value being ignored and a fixed sleep used instead
+3. Check that None (no header) still falls back to normal backoff.
+4. Check which status codes trigger a retry, and confirm 429, 500, 502, 503 and
+   504 are retried while 400, 401, 403 and 413 are not.
+5. Check whether the Azure SDK's own retries are disabled (retry_total=0 or
+   RetryPolicy.no_retries()); if not, point out where the client is created.
+
+For each issue, show the file, line, current code, and a minimal fix.
+Do not refactor anything else. If everything is correct, say so.
